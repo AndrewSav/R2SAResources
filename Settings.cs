@@ -16,7 +16,7 @@ internal partial class Settings
     public static Settings Load()
     {
         string path = Path.Join(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
-        Settings result = new Settings();
+        Settings result = new();
         IDictionary<string, object?>? dx = null;
         if (File.Exists(path))
         {
@@ -59,8 +59,7 @@ internal partial class Settings
 
     private static string? GetSteamFolder()
     {
-        string? steam = Registry.GetValue(@"HKEY_CLASSES_ROOT\steam\Shell\Open\Command", null, null) as string;
-        if (steam == null)
+        if (Registry.GetValue(@"HKEY_CLASSES_ROOT\steam\Shell\Open\Command", null, null) is not string steam)
         {
             return null;
         }

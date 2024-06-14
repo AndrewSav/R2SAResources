@@ -1,10 +1,15 @@
-﻿using System.Text;
+﻿using System.Dynamic;
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Assets.Objects.Properties;
+using CUE4Parse.UE4.Kismet;
 using CUE4Parse.UE4.Localization;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Misc;
@@ -13,6 +18,7 @@ using CUE4Parse.UE4.Readers;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion.Textures;
 using lib.remnant2.analyzer;
+using Newtonsoft.Json;
 using SkiaSharp;
 
 namespace R2SAResources;
@@ -36,8 +42,11 @@ internal class Program
         Settings settings = Settings.Load();
         Console.WriteLine($"Making sure '{settings.OutputPath}' exists...");
         Directory.CreateDirectory(settings.OutputPath);
-        DefaultFileProvider p = new DefaultFileProvider(settings.GamePath, SearchOption.AllDirectories, true, new(EGame.GAME_UE5_2));
-        p.MappingsContainer = new FileUsmapTypeMappingsProvider(settings.MappingsPath);
+        DefaultFileProvider p = new(settings.GamePath, SearchOption.AllDirectories, true, new(EGame.GAME_UE5_2))
+        {
+            MappingsContainer = new FileUsmapTypeMappingsProvider(settings.MappingsPath),
+            ReadScriptData = true
+        };
         Console.WriteLine("Loading data..");
         p.Initialize();
         Console.WriteLine("Decrypting...");
@@ -50,9 +59,15 @@ internal class Program
             string path = profileId.Split('.')[0];
             string itemId = Path.GetFileName(path);
             Console.WriteLine($"Processing {itemId}...");
-            UObject obj = p.LoadAllObjects(path).First(x => x.Name.StartsWith("Default_"));
-            ExtractLocalization(obj, localization, settings, itemId, profileId);
-            ExtractIcon(obj, p, settings.OutputPath, itemId);
+            var all = p.LoadAllObjects(path).ToList();
+
+            var debug2 = JsonConvert.SerializeObject(all, Formatting.Indented);
+
+
+            UObject def = all.Single(x => x.Name.StartsWith("Default_"));
+            UFunction? inspect = all.SingleOrDefault(x => x.Name== "ModifyInspectInfo") as UFunction;
+            ExtractLocalization(def, inspect, localization, settings, itemId, profileId);
+            ExtractIcon(def, p, settings.OutputPath, itemId);
         }
     }
 
@@ -72,7 +87,7 @@ internal class Program
             //"zh-Hant"
         };
 
-        Dictionary<string, Dictionary<string, string>> localization = new();
+        Dictionary<string, Dictionary<string, string>> localization = [];
 
         foreach (string locale in availableLocales)
         {
@@ -85,7 +100,7 @@ internal class Program
                 {
                     if (!localization.TryGetValue(entry.Key.Str, out Dictionary<string, string>? localizations))
                     {
-                        localizations = new();
+                        localizations = [];
                     }
 
                     localizations[locale] = entry.Value.LocalizedString;
@@ -97,9 +112,9 @@ internal class Program
         return localization;
     }
 
-    private static void ExtractLocalization(UObject obj, Dictionary<string, Dictionary<string, string>> localization, Settings settings, string itemId, string profileId)
+    private static void ExtractLocalization(UObject def, UFunction? inspect, Dictionary<string, Dictionary<string, string>> localization, Settings settings, string itemId, string profileId)
     {
-        FText? text = obj.Properties.SingleOrDefault(x => x.Name.Text == "Label")?.Tag?.GetValue<FText>();
+        FText? text = def.Properties.SingleOrDefault(x => x.Name.Text == "Label")?.Tag?.GetValue<FText>();
         if (text == null)
         {
             Console.WriteLine("!!!!!!!Warning, could not find item label");
@@ -120,17 +135,54 @@ internal class Program
         }
 
         localizations["en"] = text.Text;
-        localizations["Id"] = itemId;
-        localizations["ProfileId"] = profileId;
-        string json = JsonSerializer.Serialize(localizations, new JsonSerializerOptions { WriteIndented = true });
+
+        
+        Dictionary<string, Dictionary<string, string>> locres = localizations.ToDictionary(x => x.Key, x => new Dictionary<string, string> {{ "Name", x.Value }});
+        dynamic result = new ExpandoObject();
+        result.LocRes = locres;
+        result.Id = itemId;
+        result.ProfileId = profileId;
+
+        if (inspect != null)
+        {
+            foreach (KismetExpression ex in inspect.ScriptBytecode)
+            {
+                if (ex is EX_Let { Assignment: EX_CallMath { StackNode.Name: "Format" } ass })
+                {
+                    if (ass.Parameters[0] is EX_TextConst t)
+                    {
+                        if (t.Value.SourceString is EX_StringConst en)
+                        {
+                            locres["en"]["Description"] = Format(def, en.Value);
+                        }
+                        if (t.Value.KeyString is EX_StringConst key)
+                        {
+                            if (localization.TryGetValue(key.Value, out Dictionary<string, string>? desc))
+                            {
+                                foreach (string s in desc.Keys)
+                                {
+                                    if (!locres.ContainsKey(s))
+                                    {
+                                        locres[s] = new();
+                                    }
+                                    locres[s]["Description"] = Format(def, desc[s]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        string json = JsonConvert.SerializeObject(result, Formatting.Indented);
         string jsonPath = Path.Join(settings.OutputPath, itemId) + ".json";
         File.WriteAllText(jsonPath, json);
     }
 
-    private static void ExtractIcon(UObject obj, DefaultFileProvider provider, string outputPath, string itemId)
+    private static void ExtractIcon(UObject def, DefaultFileProvider provider, string outputPath, string itemId)
     {
-        StringBuilder sb = new StringBuilder();
-        obj.Properties.SingleOrDefault(x => x.Name.Text == "Icon")?.Tag?.GetValue<FPackageIndex>()?.ResolvedObject?.GetPathName(true, sb);
+        StringBuilder sb = new();
+        def.Properties.SingleOrDefault(x => x.Name.Text == "Icon")?.Tag?.GetValue<FPackageIndex>()?.ResolvedObject?.GetPathName(true, sb);
         if (sb.Length == 0)
         {
             Console.WriteLine("!!!!!!!Warning, could not find icon");
@@ -141,5 +193,70 @@ internal class Program
         var png = icon.Decode()!.Encode(SKEncodedImageFormat.Png, 100).ToArray();
         string pngPath = Path.Join(outputPath, itemId) + ".png";
         File.WriteAllBytes(pngPath, png);
+    }
+
+    private static IEnumerable<string> Tokenize(string s)
+    {
+        int state = 0;
+        StringBuilder sb = new();
+        foreach (char c in s)
+        {
+            switch (state)
+            {
+                case 0:
+                    if (c == '{')
+                    {
+                        state = 1;
+                        sb = new();
+                        sb.Append(c);
+                    }
+                    break;
+                case 1:
+                    if (c == '}')
+                    {
+                        state = 0;
+                        sb.Append(c);
+                        yield return sb.ToString();
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+                    break;
+            }
+        }
+    }
+
+    private static string Replace(string val, string token, UObject def)
+    {
+        string var = token.Trim('{', '}');
+        FPropertyTag? prop = def.Properties.SingleOrDefault(x => x.Name == var);
+        if (prop == null || prop.Tag == null)
+        {
+            //throw new InvalidOperationException($"Could not find requested property {token}, {def}");
+            return val;
+        }
+
+        string data = prop.Tag switch
+        {
+            DoubleProperty dbl => dbl.Value.ToString(CultureInfo.InvariantCulture),
+            FloatProperty flt => flt.Value.ToString(CultureInfo.InvariantCulture),
+            IntProperty integer => integer.Value.ToString(),
+            ByteProperty byt => byt.Value.ToString(),
+            NameProperty nam => nam.Value.ToString(),
+            TextProperty txt => txt.Value!.ToString(),
+            _ => throw new InvalidOperationException($"Unknown property type {prop.Tag.GetType()}{token}, {def}")
+        };
+
+        return val.Replace(token, data);
+    }
+
+    private static string Format(UObject def, string val)
+    {
+        foreach (string token in Tokenize(val))
+        {
+            val = Replace(val, token, def);
+        }
+        return val;
     }
 }
